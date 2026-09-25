@@ -1,0 +1,15 @@
+# Compiled programs
+*.o
+*.out
+
+# Common build directories
+build/
+bin/
+
+# Editor temporary files
+*.swp
+*~
+
+# IDE/editor configuration
+.vscode/
+.idea/
