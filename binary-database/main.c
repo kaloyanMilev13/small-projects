@@ -30,6 +30,13 @@ typedef struct{
 } Database;
 
 
+typedef struct {
+       
+	unsigned int record_count;
+
+} DatabaseHeader;
+
+
 int database_create(Database *db){
 
 
@@ -67,7 +74,7 @@ int write_record(Database *db, Record *rec_w){
 		return 1;
 	}else {
 	
-		fwrite(&rec_w, sizeof(Record), 1, db->fp);
+		fwrite(rec_w, sizeof(Record), 1, db->fp);
 	}
 
 	return 0;
@@ -92,7 +99,7 @@ int read_record(Database *db, Record *rec_r, int index){
 
 	}else {
 
-		if(fseek(db->fp, sizeof(Record) * index, SEEK_SET) == 0){
+		if(fseek(db->fp, sizeof(Record) * index + sizeof(DatabaseHeader), SEEK_SET) == 0){
 
 			if(fread(rec_r, sizeof(Record), 1, db->fp)){
 
