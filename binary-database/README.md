@@ -36,7 +36,7 @@ gcc main.c database.c -o build/binary_database.exe -Wall -Wextra -Wpedantic
 Run:
 
 ```bash
-./main.exe
+./build/binary_database.exe
 ```
 
 The test program checks database creation, file handling, record operations, invalid indexes, and persistence.
