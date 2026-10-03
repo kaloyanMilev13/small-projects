@@ -41,7 +41,6 @@ int database_open(Database *db, char *databaseName){
 
 		switch (db->mode) {
 
-
 			case DB_READ: db->fp = fopen(databaseName, "rb"); break;
 
 			case DB_WRITE: db->fp = fopen(databaseName, "wb"); break;
@@ -266,7 +265,6 @@ int delete_record(Database *db, int index){
 
 	if(index >= db->record_count)
 		return 1;
-
 
 	Record temp;
 
