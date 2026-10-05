@@ -1,0 +1,615 @@
+| # | Requirement | Done when |
+|---|---|---|
+| 1 | 8N1 frame encoder | Any `uint8_t` → correct start + 8 data + stop bits |
+| 2 | LSB-first transmission | Data bits appear in UART order |
+| 3 | Frame decoder | Valid 10-bit frame → original `uint8_t` |
+| 4 | Frame validation | Decoder detects invalid start/stop bits |
+| 5 | All-byte correctness | Encode/decode works for all 256 byte values |
+| 6 | Configurable baud rate | UART can be initialized with e.g. 9600 baud |
+| 7 | Bit-period calculation | 9600 baud corresponds to ≈104.17 µs/bit |
+| 8 | TX state machine | `IDLE → START → DATA → STOP → IDLE` |
+| 9 | TX non-blocking progression | One tick advances transmission rather than sending everything at once |
+| 10 | TX busy state | Code can determine whether TX is transmitting |
+| 11 | RX state machine | RX detects start, collects 8 bits, validates stop |
+| 12 | RX byte-ready state | Receiver reports when a complete byte exists |
+| 13 | RX framing error | Bad stop bit is reported |
+| 14 | TX → RX integration | TX output can directly drive RX input |
+| 15 | Multiple bytes | Can transmit a string/byte sequence, not only one byte |
+| 16 | Idle behavior | TX line stays high while nothing is transmitting |
+| 17 | Reset/reuse | UART can transmit/receive again after completing a frame |
+| 18 | Clean compiler | `-Wall -Wextra -Wpedantic -Werror` passes |
+| 19 | No test failures | Final acceptance suite passes |
+| 20 | No hardware UART | UART protocol/state behavior is implemented by your code |
+
+
+
+
+APIs - 
+
+#ifndef UART_H
+#define UART_H
+
+#include <stdint.h>
+
+#define UART_FRAME_BITS 10
+
+typedef struct {
+    uint8_t bits[UART_FRAME_BITS];
+} UARTFrame;
+
+typedef enum {
+    UART_OK,
+    UART_ERROR_START_BIT,
+    UART_ERROR_STOP_BIT
+} UARTStatus;
+
+typedef enum {
+    UART_TX_IDLE,
+    UART_TX_START,
+    UART_TX_DATA,
+    UART_TX_STOP
+} UARTTxState;
+
+typedef enum {
+    UART_RX_IDLE,
+    UART_RX_DATA,
+    UART_RX_STOP
+} UARTRxState;
+
+
+/* Frame operations */
+void encode(uint8_t byte, UARTFrame *frame);
+
+UARTStatus decode(
+    const UARTFrame *frame,
+    uint8_t *byte
+);
+
+
+/* TX */
+void uart_tx_init(uint32_t baud_rate);
+
+int uart_tx_start(uint8_t byte);
+
+uint8_t uart_tx_tick(void);
+
+int uart_tx_busy(void);
+
+
+/* RX */
+void uart_rx_init(uint32_t baud_rate);
+
+void uart_rx_tick(uint8_t line);
+
+int uart_rx_ready(void);
+
+uint8_t uart_rx_read(void);
+
+int uart_rx_framing_error(void);
+
+
+/* Timing */
+double uart_bit_period_us(uint32_t baud_rate);
+
+#endif
+
+
+
+
+
+main -
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "uart.h"
+
+static int tests_run = 0;
+static int tests_failed = 0;
+
+
+#define CHECK(condition)                                      \
+    do {                                                      \
+        tests_run++;                                          \
+        if (!(condition)) {                                   \
+            tests_failed++;                                   \
+            printf("FAIL: %s:%d: %s\n",                       \
+                   __FILE__, __LINE__, #condition);            \
+        }                                                     \
+    } while (0)
+
+
+/* ============================================================
+ * 1. ENCODER
+ * ============================================================ */
+
+static void test_encoder(void)
+{
+    UARTFrame frame;
+
+    encode(0x55, &frame);
+
+    const uint8_t expected_55[10] = {
+        0,
+        1, 0, 1, 0, 1, 0, 1, 0,
+        1
+    };
+
+    for (int i = 0; i < UART_FRAME_BITS; i++) {
+        CHECK(frame.bits[i] == expected_55[i]);
+    }
+
+
+    encode(0x00, &frame);
+
+    CHECK(frame.bits[0] == 0);
+
+    for (int i = 1; i <= 8; i++) {
+        CHECK(frame.bits[i] == 0);
+    }
+
+    CHECK(frame.bits[9] == 1);
+
+
+    encode(0xFF, &frame);
+
+    CHECK(frame.bits[0] == 0);
+
+    for (int i = 1; i <= 8; i++) {
+        CHECK(frame.bits[i] == 1);
+    }
+
+    CHECK(frame.bits[9] == 1);
+}
+
+
+/* ============================================================
+ * 2. DECODER
+ * ============================================================ */
+
+static void test_decoder(void)
+{
+    UARTFrame frame;
+    uint8_t result = 0;
+
+    encode(0xA5, &frame);
+
+    UARTStatus status = decode(&frame, &result);
+
+    CHECK(status == UART_OK);
+    CHECK(result == 0xA5);
+}
+
+
+/* ============================================================
+ * 3. INVALID FRAME DETECTION
+ * ============================================================ */
+
+static void test_invalid_start_bit(void)
+{
+    UARTFrame frame;
+    uint8_t result;
+
+    encode(0x55, &frame);
+
+    frame.bits[0] = 1;
+
+    UARTStatus status = decode(&frame, &result);
+
+    CHECK(status == UART_ERROR_START_BIT);
+}
+
+
+static void test_invalid_stop_bit(void)
+{
+    UARTFrame frame;
+    uint8_t result;
+
+    encode(0x55, &frame);
+
+    frame.bits[9] = 0;
+
+    UARTStatus status = decode(&frame, &result);
+
+    CHECK(status == UART_ERROR_STOP_BIT);
+}
+
+
+/* ============================================================
+ * 4. ALL POSSIBLE BYTES
+ * ============================================================ */
+
+static void test_all_256_bytes(void)
+{
+    for (int value = 0; value <= 255; value++) {
+
+        UARTFrame frame;
+        uint8_t decoded = 0;
+
+        encode((uint8_t)value, &frame);
+
+        UARTStatus status =
+            decode(&frame, &decoded);
+
+        CHECK(status == UART_OK);
+        CHECK(decoded == (uint8_t)value);
+    }
+}
+
+
+/* ============================================================
+ * 5. BAUD RATE / TIMING
+ * ============================================================ */
+
+static void test_baud_rate(void)
+{
+    double period;
+
+    period = uart_bit_period_us(9600);
+
+    CHECK(fabs(period - 104.166666) < 0.01);
+
+
+    period = uart_bit_period_us(115200);
+
+    CHECK(fabs(period - 8.680555) < 0.01);
+}
+
+
+/* ============================================================
+ * 6. TX IDLE
+ * ============================================================ */
+
+static void test_tx_idle(void)
+{
+    uart_tx_init(9600);
+
+    CHECK(uart_tx_busy() == 0);
+
+    /*
+     * UART line must be HIGH while idle.
+     */
+    CHECK(uart_tx_tick() == 1);
+    CHECK(uart_tx_tick() == 1);
+    CHECK(uart_tx_tick() == 1);
+}
+
+
+/* ============================================================
+ * 7. TX STATE MACHINE
+ * ============================================================ */
+
+static void test_tx_single_byte(void)
+{
+    uart_tx_init(9600);
+
+    int started = uart_tx_start(0x55);
+
+    CHECK(started == 1);
+    CHECK(uart_tx_busy() == 1);
+
+
+    const uint8_t expected[10] = {
+        0,
+        1, 0, 1, 0, 1, 0, 1, 0,
+        1
+    };
+
+
+    for (int i = 0; i < 10; i++) {
+
+        uint8_t line =
+            uart_tx_tick();
+
+        CHECK(line == expected[i]);
+    }
+
+
+    CHECK(uart_tx_busy() == 0);
+
+    /*
+     * Back to idle HIGH.
+     */
+    CHECK(uart_tx_tick() == 1);
+}
+
+
+/* ============================================================
+ * 8. TX BUSY PROTECTION
+ * ============================================================ */
+
+static void test_tx_busy(void)
+{
+    uart_tx_init(9600);
+
+    CHECK(uart_tx_start(0xAA) == 1);
+
+    /*
+     * Starting another transmission while one
+     * is active should fail.
+     */
+    CHECK(uart_tx_start(0x55) == 0);
+
+
+    while (uart_tx_busy()) {
+        uart_tx_tick();
+    }
+
+
+    /*
+     * Once finished, another byte can start.
+     */
+    CHECK(uart_tx_start(0x55) == 1);
+}
+
+
+/* ============================================================
+ * 9. RX SINGLE BYTE
+ * ============================================================ */
+
+static void test_rx_single_byte(void)
+{
+    uart_rx_init(9600);
+
+    /*
+     * 0x55 frame:
+     *
+     * start
+     * 0
+     *
+     * data
+     * 1 0 1 0 1 0 1 0
+     *
+     * stop
+     * 1
+     */
+
+    uint8_t frame[10] = {
+        0,
+        1, 0, 1, 0, 1, 0, 1, 0,
+        1
+    };
+
+
+    CHECK(uart_rx_ready() == 0);
+
+
+    for (int i = 0; i < 10; i++) {
+        uart_rx_tick(frame[i]);
+    }
+
+
+    CHECK(uart_rx_ready() == 1);
+
+    uint8_t result =
+        uart_rx_read();
+
+    CHECK(result == 0x55);
+
+    CHECK(uart_rx_ready() == 0);
+}
+
+
+/* ============================================================
+ * 10. RX FRAMING ERROR
+ * ============================================================ */
+
+static void test_rx_framing_error(void)
+{
+    uart_rx_init(9600);
+
+    uint8_t bad_frame[10] = {
+        0,
+        1, 0, 1, 0, 1, 0, 1, 0,
+
+        /* Invalid stop bit */
+        0
+    };
+
+
+    for (int i = 0; i < 10; i++) {
+        uart_rx_tick(bad_frame[i]);
+    }
+
+
+    CHECK(uart_rx_framing_error() == 1);
+
+    CHECK(uart_rx_ready() == 0);
+}
+
+
+/* ============================================================
+ * 11. TX -> RX LOOPBACK
+ * ============================================================ */
+
+static void test_loopback_single_byte(void)
+{
+    uart_tx_init(9600);
+    uart_rx_init(9600);
+
+    CHECK(uart_tx_start(0xA5) == 1);
+
+
+    while (uart_tx_busy()) {
+
+        uint8_t wire =
+            uart_tx_tick();
+
+        uart_rx_tick(wire);
+    }
+
+
+    CHECK(uart_rx_ready() == 1);
+
+    CHECK(uart_rx_read() == 0xA5);
+}
+
+
+/* ============================================================
+ * 12. TX -> RX ALL 256 BYTES
+ * ============================================================ */
+
+static void test_loopback_all_bytes(void)
+{
+    uart_tx_init(9600);
+    uart_rx_init(9600);
+
+
+    for (int value = 0; value <= 255; value++) {
+
+        CHECK(
+            uart_tx_start((uint8_t)value) == 1
+        );
+
+
+        while (uart_tx_busy()) {
+
+            uint8_t wire =
+                uart_tx_tick();
+
+            uart_rx_tick(wire);
+        }
+
+
+        CHECK(uart_rx_ready() == 1);
+
+        uint8_t received =
+            uart_rx_read();
+
+        CHECK(received == (uint8_t)value);
+    }
+}
+
+
+/* ============================================================
+ * 13. MULTIPLE BYTES / STRING
+ * ============================================================ */
+
+static void test_string_loopback(void)
+{
+    uart_tx_init(9600);
+    uart_rx_init(9600);
+
+
+    const char message[] =
+        "Hello UART!";
+
+
+    char received[sizeof(message)];
+
+
+    for (size_t i = 0;
+         i < strlen(message);
+         i++) {
+
+        CHECK(
+            uart_tx_start(
+                (uint8_t)message[i]
+            ) == 1
+        );
+
+
+        while (uart_tx_busy()) {
+
+            uint8_t wire =
+                uart_tx_tick();
+
+            uart_rx_tick(wire);
+        }
+
+
+        CHECK(uart_rx_ready() == 1);
+
+        received[i] =
+            (char)uart_rx_read();
+    }
+
+
+    received[strlen(message)] = '\0';
+
+
+    CHECK(strcmp(message, received) == 0);
+}
+
+
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+
+int main(void)
+{
+    printf(
+        "============================\n"
+        " Software UART Test Suite\n"
+        "============================\n\n"
+    );
+
+
+    test_encoder();
+    test_decoder();
+
+    test_invalid_start_bit();
+    test_invalid_stop_bit();
+
+    test_all_256_bytes();
+
+    test_baud_rate();
+
+    test_tx_idle();
+    test_tx_single_byte();
+    test_tx_busy();
+
+    test_rx_single_byte();
+    test_rx_framing_error();
+
+    test_loopback_single_byte();
+    test_loopback_all_bytes();
+
+    test_string_loopback();
+
+
+    printf(
+        "\n============================\n"
+    );
+
+    printf(
+        "Tests run:    %d\n",
+        tests_run
+    );
+
+    printf(
+        "Tests failed: %d\n",
+        tests_failed
+    );
+
+
+    if (tests_failed == 0) {
+
+        printf(
+            "\nALL TESTS PASSED\n"
+            "Software UART complete.\n"
+        );
+
+        return 0;
+    }
+
+
+    printf(
+        "\nSOFTWARE UART NOT COMPLETE\n"
+    );
+
+    return 1;
+}
+
+
+
+
+compile with - 
+
+
+gcc -Wall -Wextra -Wpedantic -Werror \
+    main.c uart.c \
+    -lm \
+    -o uart_test
